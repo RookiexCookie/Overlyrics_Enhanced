@@ -1,15 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Overlyrics v3.1 (PySide6 Redesign - Corrected)
-
-Redesigned with:
-- A two-bar (current, next) UI.
-- Qt6 (PySide6) for hardware acceleration and full transparency.
-- Smooth fade-in/fade-out animations for lyric transitions.
-- High-performance, multi-threaded signal/slot architecture.
-- Corrected thread management and cleanup.
-"""
-
 import sys
 import os
 import re
