@@ -23,7 +23,7 @@
     </a>
  <p align="center">
    <a>
-      <img src="demo.mp4"/>
+      <video src="demo.mp4"/>
     </a>
   </p>
 
