@@ -1,5 +1,5 @@
 <p align="center">
- <img width="400px" src="Logos/main-logo.png" align="center" alt="GitHub Readme Stats" />
+ <img width="400px" src="https://github.com/CezarGab/Overlyrics/raw/main/Logos/main-logo.png" align="center" alt="GitHub Readme Stats" />
  <h2 align="center">Overlyrics Enhanced</h2>
  <p align="center">Bringing the lyrics to life!</p>
 </p>
@@ -23,7 +23,7 @@
     </a>
  <p align="center">
    <a>
-      <img src="demo.gif"/>
+      <img src="demo.mp4"/>
     </a>
   </p>
 
