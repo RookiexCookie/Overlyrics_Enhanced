@@ -1,7 +1,0 @@
-old-versions/*
-__pycache__/*
-build/*
-python-client-generated/*
-readmes/*
-.cache_sp
-.cache

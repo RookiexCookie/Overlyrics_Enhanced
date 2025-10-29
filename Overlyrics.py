@@ -1,424 +1,656 @@
 # -*- coding: utf-8 -*-
+"""
+Overlyrics v3.1 (PySide6 Redesign - Corrected)
 
-import tkinter as tk
-import tkinter.ttk as ttk
-import time
-from datetime import datetime
-import re
-import syncedlyrics
-import sched
-import spotipy
-from spotipy.oauth2 import SpotifyOAuth
-import threading
-import queue
+Redesigned with:
+- A two-bar (current, next) UI.
+- Qt6 (PySide6) for hardware acceleration and full transparency.
+- Smooth fade-in/fade-out animations for lyric transitions.
+- High-performance, multi-threaded signal/slot architecture.
+- Corrected thread management and cleanup.
+"""
+
 import sys
-from tkinter import messagebox
-import tkinter.font as font
 import os
+import re
+import time
 import webbrowser
+from datetime import datetime
+import syncedlyrics
+import spotipy
+from spotipy.oauth2 import SpotifyPKCE
+from tkinter import messagebox, Tk
+import tkinter as tk # Keep for auth window
 
-# Constants:
-VERBOSE_MODE = False # If true, prints specific logs in the code (for debugging)
-CUSTOM_EXCEPT_HOOK = True # If active, errors appear in customized window
+# --- Import PySide6 (Qt) ---
+from PySide6.QtCore import (
+    Qt, QThread, QObject, Signal, Slot, QTimer, QPoint, QPropertyAnimation, QEasingCurve,
+    QParallelAnimationGroup
+)
+from PySide6.QtGui import QAction
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QLabel, QVBoxLayout, QMenu, QGraphicsOpacityEffect
+)
 
-PERIOD_TO_UPDATE_TRACK_INFO = 0.1 # Updates the displaying verses every PERIOD_TO_UPDATE_TRACK_INFO seconds
+# --- Constants ---
+VERBOSE_MODE = False
+# Polls Spotify API (slow)
+TRACK_INFO_POLL_RATE = 1.0  # (seconds) How often to ask Spotify what's playing
+# Updates lyrics UI (fast)
+LYRIC_UPDATE_POLL_RATE = 0.05 # (seconds) Update every 50ms for smoother sync
 
-def create_overlay_text():
-    # Main window = root
-    root = tk.Tk()
-    root.attributes("-topmost", True)
-    root.overrideredirect(True)
+# --- IMPORTANT: Paste your own Client ID here ---
+# 1. Go to https://developer.spotify.com/dashboard/
+# 2. Create an app
+# 3. Paste the Client ID here
+CLIENT_ID = "026011d0727c4c2db8c9b77405efa6f4" 
+# 4. In your app's settings, add this as a Redirect URI
+REDIRECT_URI = "https://cezargab.github.io/Overlyrics"
+SCOPE = "user-read-playback-state"
 
-    root.configure(bg="#010311")
+# --- Helper for Auth Window (using tkinter) ---
+def show_auth_code_window():
+    """Uses a simple Tkinter window to get the auth code."""
+    auth_code = None
     
-    root.title("Overlyrics")
-    root.iconbitmap(default="icons/overlyrics-icon.ico")
+    def on_finish():
+        nonlocal auth_code
+        auth_code = code_entry.get()
+        auth_window.destroy()
 
-    try:  # Try to load the custom font
-        custom_font = font.Font(family="Public Sans", size="22", weight="normal")
-    except tk.TclError:
-        custom_font = font.Font(family="Arial", size="22", weight="normal")
-
-    # Adding the icon on the left of the main window
-    image = tk.PhotoImage(file="icons/gray-icon.png")
-    image_label = tk.Label(root, image=image, bg="#010311", highlightbackground="#010311")
-    image_label.pack(side=tk.LEFT)  
-
-    # Initial text (while authentication is performed)
-    text = tk.Label(root, text="Starting...", font=custom_font, fg="#dfe0eb", bg="#010311")
-    text.pack(expand=True)
-
-    # Sets the transparency of the window when clicking, based on the operating system
-    if root.tk.call("tk", "windowingsystem") == "win32":
-        # For Windows, we use the -alpha attribute
-        root.attributes("-alpha", 1.0)  # 1.0 = fully opaque
-        root.bind("<Enter>", lambda event: root.attributes("-alpha", 0.1))  # 10% opacity when hovering
-        root.bind("<Leave>", lambda event: root.attributes("-alpha", 1.0))
-
-    elif root.tk.call("tk", "windowingsystem") == "aqua":
-        # For macOS, we use the attribute -transparentcolor
-        root.attributes("-transparentcolor", "#010311")  # NOTE: not tested
-
-    # Allows to drag the window:
-    drag_start_x = 0
-    drag_start_y = 0
-
-    def on_drag_start(event):
-        nonlocal drag_start_x, drag_start_y
-        drag_start_x = event.x
-        drag_start_y = event.y
-
-    def on_dragging(event):
-        root_x = root.winfo_x() + (event.x - drag_start_x)
-        root_y = root.winfo_y() + (event.y - drag_start_y)
-        root.geometry(f"+{root_x}+{root_y}")
-
-    root.bind("<ButtonPress-1>", on_drag_start)
-    root.bind("<B1-Motion>", on_dragging)
-
-    return root, text, image
-
-def update_overlay_text():
-    global actualTrackLyrics, actualVerse, parsed_lyrics, time_str, timestampsInSeconds
-
-    def find_nearest_time(currentProgress, timestampsInSeconds, parsed_lyrics):
-        keys_list = list(parsed_lyrics.keys())
-        filtered_keys = list(filter(lambda x: timestampsInSeconds[keys_list.index(x)] <= currentProgress, keys_list)) # verses before present time
-
-        if not filtered_keys: # condition where there are no previous verses
-            verse = keys_list[0] # returns the first verse
-        else:
-            verse = max(filtered_keys, key=lambda x: timestampsInSeconds[keys_list.index(x)]) # returns the verse closest to the current time
-        return verse
-
-    print("Entered into update_overlay_text()") if VERBOSE_MODE else None    
-
-    if(parsing_in_progress_event.is_set()): # Does not update the overlay if parsing is still being done
-        return
-
-    elif(time_str == "TypeError" or time_str == [] or parsed_lyrics == {}):
-        print("Lyrics file error.") if VERBOSE_MODE else None
-        nolyricsfound()
-        return
-    else:
-        # Finds the section of the letter closest to the current time
-        currentLyricTime = find_nearest_time(currentProgress, timestampsInSeconds, parsed_lyrics) ## format: HH:MM:SS 
-        actualVerse = parsed_lyrics[currentLyricTime]
-        
-        lyrics_verse_event.set()
-
-def getCurrentTrackInfo():
-    current_track = sp.current_user_playing_track() # Get the information of the music being listened to, through the API
+    auth_window = Tk()
+    auth_window.title("Overlyrics: Authentication")
+    auth_window.geometry("500x200")
     
-    # Check if there is music playing
-    if current_track is None or (current_track['item'] is None):
-        return None  # No track is currently playing
-        # NOTE: When the song is changed by the search bar, current_track['item'] initially does not exist.
-        # This conditional prevents this from generating an error.
+    label_text = (
+        "Please proceed with authentication in your browser.\n"
+        "Then, paste the code from the URL here."
+    )
+    label = tk.Label(auth_window, text=label_text, padx=10, pady=10)
+    label.pack()
     
-    # Extracts relevant information from the track
-    artist = current_track['item']['artists'][0]['name']
-    track_name = current_track['item']['name']
-    is_playing = current_track['is_playing']
-    progress_ms = current_track['progress_ms']
+    code_entry = tk.Entry(auth_window, width=50)
+    code_entry.pack(pady=10, padx=20, fill='x')
     
-    # Convert progress_ms to minutes and seconds
-    progress_sec = progress_ms // 1000
-    progress_min = progress_sec // 60
-    progress_sec %= 60
+    finish_button = tk.Button(auth_window, text="Finish Authentication", command=on_finish)
+    finish_button.pack(pady=10)
+
+    auth_window.attributes("-topmost", True)
+    # Center the window
+    auth_window.update_idletasks()
+    width = auth_window.winfo_width()
+    height = auth_window.winfo_height()
+    x = (auth_window.winfo_screenwidth() // 2) - (width // 2)
+    y = (auth_window.winfo_screenheight() // 2) - (height // 2)
+    auth_window.geometry(f'{width}x{height}+{x}+{y}')
+    auth_window.mainloop()
+    return auth_code
+
+# --- Worker for Spotify API (slow polling) ---
+class SpotifyAPIWorker(QObject):
+    """
+    Runs in a separate thread.
+    Polls Spotify API at a slow, safe rate.
+    """
+    trackInfoReady = Signal(dict)
+    noMusic = Signal()
+    apiError = Signal(str)
+    finished = Signal() # <-- FIX: Added this signal
     
-    # Return
-    return {
-        'artist': artist,
-        'trackName': track_name,
-        'progressMin': progress_min,
-        'progressSec': progress_sec,
-        'isPlaying': is_playing
-    }
+    def __init__(self, auth_manager):
+        super().__init__()
+        self.auth_manager = auth_manager
+        self.sp = None
+        self._is_running = True
+        self._is_paused = False # Internal state for polling rate
 
-# Function to update song information
-def update_track_info():
-    while True:
-        global trackName, artistName, currentProgress, isPaused 
-        trackName, artistName, currentProgress, isPaused = get_track_info()
-        time.sleep(PERIOD_TO_UPDATE_TRACK_INFO)   # Wait PERIOD_TO_UPDATE_TRACK_INFO second before getting the information again
-
-# Function to get the useful song information
-def get_track_info():
-    global trackName, artistName, currentProgress, isPaused 
-
-    trackInfo = getCurrentTrackInfo()
-
-    if(trackInfo is None):
-        trackName = artistName = currentProgress = isPaused = None
-    else:    
-        previousTrackName = trackName
-
-        trackName = trackInfo['trackName']
-        artistName = trackInfo['artist']
-        currentProgress = trackInfo['progressMin'] * 60 + trackInfo['progressSec']
-        isPaused = not trackInfo['isPlaying']
-
-        print("get_track_info(): ", trackName) if VERBOSE_MODE else None
-        if((previousTrackName != trackName) and (trackName != None) and (trackName != " ")):
-            print("get_track_info() - nova musica: " + trackName) if VERBOSE_MODE else None
-            update_track_event.set()
-            parsing_in_progress_event.set()
-
-
-    update_event.set()  # Flag that variables have been updated
-
-    return trackName, artistName, currentProgress, isPaused
-
-def update_display():
-    while True:
-        display_lyrics(trackName, artistName, currentProgress, isPaused)
-        
-        if(trackName is None):
-            noMusicIsPlayingOnSpotify()
-        else:
-            update_overlay_text()
-
-# Function to display the synchronized lyrics
-def display_lyrics(trackName, artistName, currentProgress, isPaused):
-        global actualTrackLyrics, parsed_lyrics, time_str, timestampsInSeconds
-
-        def getParsedLyrics(lyrics): ## Returns a dict with the entire lyrics and the respectively timestamps
-            lines = lyrics.split('\n')  # Divides the lyrics by the verses/lines
-            parsed_lyrics = {}  # Dict to storage strings of timestaps and the text lyrics
-            time_strs = []
-
-            for line in lines:
-                line = line.strip() # Removes the initial backspace
-                if line and line.startswith("["):
-                    parsed_line = parse_line(line)
-                    if parsed_line:
-                        time_str, verse_text = parsed_line
-                        parsed_lyrics[time_str] = verse_text
-                        time_strs.append(time_str)
-
-            return parsed_lyrics, time_strs
-
-        def parse_line(line): # Parses the timestamp and the verse in LRC (Lyric File Format)
-            pattern = r'\[(\d{2}:\d{2}\.\d{2})\](.+)'
-            match = re.match(pattern, line)
-
-            if match:
-                time_str = match.group(1)
-                verse_text = match.group(2).strip()
-                return time_str, verse_text
-
-            else:
-                print("Returning None in parse_line().") if VERBOSE_MODE else None
-                return None
-
-        def convert_to_seconds(time_strs):
-            total_seconds = []
-            for i, time_str in enumerate(time_strs):
-                time_obj = datetime.strptime(time_str, "%M:%S.%f")
-                seconds = (time_obj.minute * 60) + time_obj.second + (time_obj.microsecond / 1000000)
-                total_seconds.append(seconds)
-            return total_seconds
-
-
-        print("trackName in display_lyrics: ", trackName) if VERBOSE_MODE else None
-
-        if (update_track_event.is_set()):
-            # If the track has changed, than the new lyrics will be searched and the windows will be updated
-            update_track_event.clear()
-
-            searchTerm = "{} {}".format(trackName, artistName)
-            lyrics = syncedlyrics.search(searchTerm)
-
-            if (lyrics is None or lyrics.isspace()):
-                print("Track not found.") if VERBOSE_MODE else None
-                nolyricsfound()
-            else:
-                print("display_lyrics: >>", trackName, "<<") if VERBOSE_MODE else None
-                
-                actualTrackLyrics = lyrics
-                parsed_lyrics, time_str = getParsedLyrics(actualTrackLyrics)             
-                timestampsInSeconds = convert_to_seconds(time_str)
-
-
-            parsing_in_progress_event.clear()
-
-
-        update_event.wait()  # Waiting until the variables update
-        update_event.clear()  # Clearing the update signal event
-
-def spotipyAutenthication():
-    # Descontinuado/Deprecated (needs the client_secret, which can't be exposed):
-    #sp = spotipy.Spotify(auth_manager=SpotifyOAuth(client_id="7710e2a5ffe241fd908c556a08452341", client_secret="<SECRET>", 
-    # redirect_uri="https://google.com", scope="user-library-read, user-read-playback-state"))
-    def authWindowToGetAuthCode():
-        def paste_from_clipboard(): # Handle of copy/paste button
-            clipboard_content = authWindow.clipboard_get()
-            codeEntry.delete(0, tk.END)
-            codeEntry.insert(0, clipboard_content)
-
-        def finish_authentication(): # Handle of finish button
-            nonlocal auth_code
-            auth_code = codeEntry.get()
-            authWindow.destroy()
-
-        auth_code = None
-
-        authWindow = tk.Tk()
-        authWindow.iconbitmap(default="icons/overlyrics-icon.ico")
-        authWindow.title("Overlyrics: autenticação")
-
-        try:  # Trying to load the custom font from the ttf file
-           custom_font = font.Font(family="Public Sans", size="12", weight="normal")
-        except tk.TclError:
-           custom_font = font.Font(family="Arial", size="12", weight="normal")
-
-        # Theme Forest TTK by rdbende
-        authWindow.tk.call('source', 'tkinter-themes/forest-dark.tcl')
-        ttk.Style().theme_use('forest-dark')
-
-        # Window settings
-        width=600
-        height=500
-        screenwidth = authWindow.winfo_screenwidth()
-        screenheight = authWindow.winfo_screenheight()
-        alignstr = '%dx%d+%d+%d' % (width, height, (screenwidth - width) / 2, (screenheight - height) / 2)
-        authWindow.geometry(alignstr)
-        authWindow.resizable(width=False, height=False)
-
-        # Loading logo
-        logo_path = "imgs/main-logo-png.png"
-        logo_img = tk.PhotoImage(file=logo_path).subsample(6)
-        # Displays the logo at the center
-        logo_label = tk.Label(authWindow, image=logo_img)
-        logo_label.pack(pady=0)
-
-        #>>> LABELS:
-        # Code Entry
-        codeEntry=ttk.Entry(authWindow)
-        codeEntry["font"] = custom_font
-        codeEntry["justify"] = "center"
-        codeEntry["text"] = ""
-        codeEntry.place(x=30,y=250,width=551,height=59)
-
-        # Paste button
-        paste_button = ttk.Button(authWindow, text="Colar / Paste", command=paste_from_clipboard)
-        paste_button.place(x=475, y=255, width=100, height=50)
-
-        # Text entry
-        text_en=tk.Label(authWindow)
-        text_en["font"] = custom_font
-        text_en["justify"] = "center"
-        text_en["text"] = "Proceed the authentication in your browser and paste the code bellow."
-        text_en.place(x=0,y=200,width=599,height=36)
-        text_br=tk.Label(authWindow)
-        text_br["font"] = custom_font
-        text_br["justify"] = "center"
-        text_br["text"] = "Prossiga com a autenticação pelo navegador e cole o código abaixo."
-        text_br.place(x=0,y=160,width=599,height=30)
-
-        # "Finalizar autenticação / Finish Authentication" button
-        finish_button = ttk.Button(authWindow, text="Finalizar autenticação / Finish Authentication", command=finish_authentication, style="Accent.TButton")
-        finish_button.place(x=30, y=340, width=551, height=30)
-
-        while(auth_code is None):
-            authWindow.mainloop()
-
-        return auth_code
-
-    def PKCE_getAcessToken():
-        authURL = authManager.get_authorize_url()
-
-        # [CURRENTLY UNNECESSARY] 
-        # Solving a bug with PyInstaller (github.com/pyinstaller/pyinstaller/issues/6334)
-        #lp_key = "LD_LIBRARY_PATH"
-        #lp_orig = os.environ.get(f"{lp_key}_ORIG")
-        #if lp_orig is not None:
-        #    os.environ[lp_key] = lp_orig
+    @Slot()
+    def run(self):
+        """Authenticates and starts the polling timer."""
         try:
-            webbrowser.open_new_tab(authURL)
+            cached_token = self.auth_manager.get_cached_token()
+            if cached_token is None:
+                raise Exception("No cached token")
+            
+            if self.auth_manager.is_token_expired(cached_token):
+                print("[INFO] Token expired, refreshing...")
+                cached_token = self.auth_manager.refresh_access_token(cached_token['refresh_token'])
+            
+            self.sp = spotipy.Spotify(auth_manager=self.auth_manager)
+            self.sp.current_user() # Test API call
+            print("[INFO] Authenticated using cached token.")
+            
         except Exception as e:
-            raise Exception("Error when opening website in default browser to perform authentication. Please check your internet and try again.") 
+            print(f"[INFO] Cache auth failed ({e}). Proceeding with manual auth.")
+            auth_url = self.auth_manager.get_authorize_url()
+            webbrowser.open_new_tab(auth_url)
+            
+            auth_code = show_auth_code_window()
+            if not auth_code:
+                self.apiError.emit("Authentication cancelled by user.")
+                self.finished.emit() # <-- FIX: Emit finished on auth fail
+                return
 
-        auth_code = authWindowToGetAuthCode() 
-        access_token = authManager.get_access_token(code=auth_code, check_cache=False) #
+            try:
+                access_token = self.auth_manager.get_access_token(code=auth_code, check_cache=False)
+                self.sp = spotipy.Spotify(auth_manager=self.auth_manager)
+            except Exception as auth_e:
+                self.apiError.emit(f"Authentication failed: {auth_e}")
+                self.finished.emit() # <-- FIX: Emit finished on auth fail
+                return
         
-        return access_token
-
-    authManager = spotipy.oauth2.SpotifyPKCE(client_id="7710e2a5ffe241fd908c556a08452341", 
-                                redirect_uri="https://cezargab.github.io/Overlyrics", 
-                                scope="user-read-playback-state",
-                                cache_handler= spotipy.CacheFileHandler(".cache_sp"),
-                                open_browser=True)
-
-    try: # Tries to use the cache to authenticate
-        cached_token = authManager.get_cached_token() 
-        if cached_token is None:
-            raise Exception
-        spAPIManager = spotipy.Spotify(auth_manager=authManager)       
-    except: # If there is no token in the cache, follow the procedure for manual authentication
-        access_token = PKCE_getAcessToken()
-        spAPIManager = spotipy.Spotify(auth_manager=authManager, auth=access_token)
+        # Start the polling loop
+        print("[INFO] SpotifyAPIWorker started.")
+        while self._is_running:
+            self.poll_spotify()
+            
+            poll_rate = TRACK_INFO_POLL_RATE
+            if not self.sp or self._is_paused:
+                poll_rate *= 3 # Poll slower if paused or no music
+                
+            # Sleep in small chunks to be responsive to stop()
+            for _ in range(int(poll_rate / 0.1)):
+                if not self._is_running:
+                    break
+                time.sleep(0.1)
         
-    return spAPIManager
+        self.finished.emit() # <-- FIX: Emit finished when loop ends
+        print("[INFO] SpotifyAPIWorker finishing.")
 
-def nolyricsfound():
-    global actualVerse, parsed_lyrics
-    parsed_lyrics={}
-    actualVerse='No lyrics found.'
-    lyrics_verse_event.set()
+    @Slot()
+    def poll_spotify(self):
+        if not self.sp:
+            return
 
-def noMusicIsPlayingOnSpotify():
-    global actualVerse
-    actualVerse = "No song is being heard on Spotify."
-    lyrics_verse_event.set()
+        try:
+            track_info = self.sp.current_user_playing_track()
+            
+            if track_info is None or track_info['item'] is None:
+                self.noMusic.emit()
+                self._is_paused = True
+                return
+            
+            self._is_paused = not track_info['is_playing']
+            self.trackInfoReady.emit(track_info)
+            
+        except spotipy.exceptions.SpotifyException as e:
+            if "invalid access token" in str(e).lower():
+                self.apiError.emit("Auth token expired. Please restart.")
+                self.stop()
+            else:
+                print(f"[ERROR] Spotify API error: {e}")
+        except Exception as e:
+            print(f"[ERROR] Error in track_info_updater: {e}")
 
-def custom_excepthook(exctype, value, traceback): # If activated, execution time errors opens a windows to handle the error
-    root = tk.Tk()
-    root.withdraw()  # Hides the main window to show only the error window
-    messagebox.showerror("Overlyrics: Error", f"The following error occurred: {value}")
-    root.destroy()
+    @Slot()
+    def stop(self):
+        self._is_running = False
+        print("[INFO] SpotifyAPIWorker stopping...")
 
-# Custom excepthook if activated 
-if CUSTOM_EXCEPT_HOOK == True:
-    sys.excepthook = custom_excepthook 
-
-# Global variables
-trackName = ""
-artistName = ""
-currentProgress = 0
-isPaused = False
-actualVerse = ""
-
-actualTrackLyrics = ""
-parsed_lyrics = {}
-time_str = ""
-timestampsInSeconds = []
-
-sp = spotipyAutenthication()
-
-overlay_root, overlay_text, overlay_image = create_overlay_text()
-overlay_root.update()
-
-update_event = threading.Event() # Create an event to flag the variables update
-update_track_event = threading.Event() # Create an event to flag the track update
-lyrics_verse_event = threading.Event() # Create an event to flag the verse update
-parsing_in_progress_event = threading.Event() # Create an event to flag the parsing in progress
-
-# Updates the track infos in a separated thread, every PERIOD_TO_UPDATE_TRACK_INFO seconds
-update_thread = threading.Thread(target=update_track_info) 
-update_thread.start()
-
-# Updates the main window continuously, in a separate thread
-update_display_thread = threading.Thread(target=update_display)
-update_display_thread.start()
-
-
-while True:
-    lyrics_verse_event.wait() # Wait for the next verse to updates the main window
+# --- Worker for Lyric Syncing (fast polling) ---
+class LyricSyncWorker(QObject):
+    """
+    Runs in a separate thread.
+    Parses lyrics and runs a fast timer to find the current line.
+    """
+    lyricsReady = Signal(str, str) # main, next
+    statusUpdate = Signal(str, str) # main, next
+    finished = Signal() # <-- FIX: Added this signal
     
-    # Updates the main window
-    overlay_text.config(text=actualVerse)
-    overlay_root.update()
+    def __init__(self):
+        super().__init__()
+        self.parsed_lyrics = []
+        self.track_name = ""
+        self.artist_name = ""
+        self.current_progress_sec = 0.0
+        self.is_paused = True
+        self.last_api_call_time = 0.0
+        self.last_main_verse = ""
+        self._is_running = True
+        self._timer_running = False
 
-    lyrics_verse_event.clear()
+    @Slot(dict)
+    def on_track_info_ready(self, track_info):
+        """Receives new track info from the API worker."""
+        new_track_name = track_info['item']['name']
+        self.is_paused = not track_info['is_playing']
+        self.current_progress_sec = track_info['progress_ms'] / 1000.0
+        self.last_api_call_time = time.time()
+        
+        if new_track_name != self.track_name:
+            print(f"[INFO] New track detected: {new_track_name}")
+            self.track_name = new_track_name
+            self.artist_name = track_info['item']['artists'][0]['name']
+            self.parsed_lyrics = [] # Clear old lyrics
+            self.last_main_verse = ""
+            self.statusUpdate.emit("Loading lyrics...", "")
+            self.search_for_lyrics() # Run in this thread
+        
+        if not self._timer_running:
+            self._timer_running = True
+            # Use QTimer.singleShot for a non-blocking start
+            QTimer.singleShot(0, self.start_fast_poll)
+
+    @Slot()
+    def on_no_music(self):
+        self.track_name = ""
+        self.is_paused = True
+        self.parsed_lyrics = []
+        self.statusUpdate.emit("No music playing on Spotify.", "")
+        
+    def search_for_lyrics(self):
+        """Searches for and parses lyrics."""
+        try:
+            search_term = f"{self.track_name} {self.artist_name}"
+            lyrics = syncedlyrics.search(search_term)
+
+            if lyrics is None or lyrics.isspace():
+                self.statusUpdate.emit("No lyrics found.", "")
+                self.parsed_lyrics = []
+            else:
+                self.parsed_lyrics = self.get_parsed_lyrics(lyrics)
+                if not self.parsed_lyrics:
+                    self.statusUpdate.emit("Could not parse lyrics.", "")
+                    
+        except Exception as e:
+            print(f"[ERROR] Error in lyrics_parser: {e}")
+            self.statusUpdate.emit("Error finding lyrics.", "")
+
+    def get_parsed_lyrics(self, lyrics):
+        """Parses LRC string into [(timestamp, text)]."""
+        parsed_list = []
+        pattern = r'\[(\d{2}:\d{2}\.\d{2})\](.+)'
+        for line in lyrics.split('\n'):
+            match = re.match(pattern, line.strip())
+            if match:
+                time_str, verse_text = match.group(1), match.group(2).strip()
+                if not verse_text:
+                    verse_text = "..."
+                try:
+                    time_obj = datetime.strptime(time_str, "%M:%S.%f")
+                    seconds = (time_obj.minute * 60) + time_obj.second + (time_obj.microsecond / 1000000)
+                    parsed_list.append((seconds, verse_text))
+                except ValueError:
+                    continue
+        parsed_list.sort(key=lambda x: x[0])
+        return parsed_list
+
+    @Slot()
+    def start_fast_poll(self):
+        """Starts the fast QTimer loop."""
+        # <-- FIX: Check for stop signal at the beginning
+        if not self._is_running: 
+            self.finished.emit()
+            print("[INFO] LyricSyncWorker finishing.")
+            return
+            
+        self.update_lyric_line()
+        # Schedule the next call
+        QTimer.singleShot(int(LYRIC_UPDATE_POLL_RATE * 1000), self.start_fast_poll)
+        
+    def update_lyric_line(self):
+        """Finds the current lyric line based on precise time."""
+        if self.is_paused or not self.parsed_lyrics or not self.track_name:
+            return # Don't update if paused or no lyrics
+
+        # Calculate precise progress
+        time_since_last_poll = time.time() - self.last_api_call_time
+        precise_progress = self.current_progress_sec + time_since_last_poll
+
+        # Find the current lyric index
+        current_index = -1
+        for i, (timestamp, _) in enumerate(self.parsed_lyrics):
+            if timestamp > precise_progress:
+                break
+            current_index = i
+        
+        # Get lyrics
+        main_lyric = "..."
+        next_lyric = ""
+
+        if current_index == -1:
+            main_lyric = "..."
+            if self.parsed_lyrics:
+                next_lyric = self.parsed_lyrics[0][1]
+        else:
+            main_lyric = self.parsed_lyrics[current_index][1]
+            if current_index + 1 < len(self.parsed_lyrics):
+                next_lyric = self.parsed_lyrics[current_index + 1][1]
+
+        # Only emit a signal if the main lyric has changed
+        if main_lyric != self.last_main_verse:
+            self.last_main_verse = main_lyric
+            self.lyricsReady.emit(main_lyric, next_lyric)
+
+    @Slot()
+    def stop(self):
+        self._is_running = False
+        self._timer_running = False
+        print("[INFO] LyricSyncWorker stopping...")
+
+# --- Main UI Window ---
+class OverlyricsWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        
+        # --- Font Configuration ---
+        self.main_font_size = 12
+        self.next_font_size = 7   
+        self.main_font_family = "Public Sans"
+        self.main_font_color = "#FFFFFF" # White
+        self.next_font_color = "#AAAAAA" # Gray
+        
+        # Check if font exists
+        try:
+            # Use tkinter to check font
+            root = Tk()
+            root.withdraw()
+            tk.font.Font(family="Public Sans")
+            root.destroy()
+        except Exception:
+            print("[WARN] 'Public Sans' not found. Falling back to Arial.")
+            self.main_font_family = "Arial"
+
+        # --- Window Flags ---
+        self.setWindowFlags(
+            Qt.FramelessWindowHint |       # No title bar, no borders
+            Qt.WindowStaysOnTopHint    # Always on top
+                  # Don't show in taskbar alt-tab
+        )
+        # --- Full Transparency ---
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        
+        self.drag_start_position = None
+        
+        # --- Create Layout ---
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(0)
+
+        # --- Create Labels ---
+        self.next_label = QLabel("...")
+        self.next_label.setAlignment(Qt.AlignCenter)
+
+        self.main_label = QLabel("Starting Overlyrics...")
+        self.main_label.setAlignment(Qt.AlignCenter)
+
+        self.layout.addWidget(self.next_label)
+        self.layout.addWidget(self.main_label)
+
+        # Hidden alt main label for fade animation
+        self.main_label_hidden = QLabel("")
+        self.main_label_hidden.setAlignment(Qt.AlignCenter)
+        self.layout.addWidget(self.main_label_hidden)
+        self.main_label_hidden.setHidden(True)
+
+        # Make full layout centered
+        self.layout.setAlignment(Qt.AlignCenter)
+        # --- Animation Setup ---
+        # We need two main labels to fade between
+        self.main_label_hidden = QLabel("")
+        self.main_label_hidden.setAlignment(Qt.AlignCenter)
+        self.layout.addWidget(self.main_label_hidden)
+        self.main_label_hidden.setHidden(True)
+        
+        self.main_opacity_effect = QGraphicsOpacityEffect(self.main_label)
+        self.main_label.setGraphicsEffect(self.main_opacity_effect)
+        
+        self.hidden_opacity_effect = QGraphicsOpacityEffect(self.main_label_hidden)
+        self.main_label_hidden.setGraphicsEffect(self.hidden_opacity_effect)
+        
+        self.active_main_label = self.main_label
+        self.inactive_main_label = self.main_label_hidden
+        
+        self.animation_group = QParallelAnimationGroup(self)
+
+        self.update_font_styles()
+        self.setup_workers()
+
+    def setup_workers(self):
+        """Creates and starts the background threads and workers."""
+        try:
+            self.auth_manager = SpotifyPKCE(
+                client_id=CLIENT_ID,
+                redirect_uri=REDIRECT_URI,
+                scope=SCOPE,
+                cache_handler=spotipy.CacheFileHandler(".cache_sp"),
+                open_browser=False
+            )
+        except Exception as e:
+            self.show_error(f"Failed to init auth: {e}")
+            return
+
+        # Create API Worker Thread
+        self.api_thread = QThread()
+        self.api_worker = SpotifyAPIWorker(self.auth_manager)
+        self.api_worker.moveToThread(self.api_thread)
+        self.api_thread.started.connect(self.api_worker.run)
+        self.api_worker.apiError.connect(self.show_error)
+
+        # Create Lyric Sync Worker Thread
+        self.lyric_thread = QThread()
+        self.lyric_worker = LyricSyncWorker()
+        self.lyric_worker.moveToThread(self.lyric_thread)
+        # self.lyric_thread.started.connect(self.lyric_worker.start_fast_poll) # <-- This is started by on_track_info_ready
+
+        # Connect signals
+        self.api_worker.trackInfoReady.connect(self.lyric_worker.on_track_info_ready)
+        self.api_worker.noMusic.connect(self.lyric_worker.on_no_music)
+        
+        self.lyric_worker.lyricsReady.connect(self.on_new_lyrics)
+        self.lyric_worker.statusUpdate.connect(self.on_status_update)
+        
+        # --- FIX: Correct Thread Cleanup ---
+        # When worker emits finished, tell its thread to quit
+        self.api_worker.finished.connect(self.api_thread.quit)
+        self.lyric_worker.finished.connect(self.lyric_thread.quit)
+
+        # When thread has *actually* finished, schedule worker and thread for deletion
+        self.api_thread.finished.connect(self.api_worker.deleteLater)
+        self.lyric_thread.finished.connect(self.lyric_worker.deleteLater)
+        self.api_thread.finished.connect(self.api_thread.deleteLater)
+        self.lyric_thread.finished.connect(self.lyric_thread.deleteLater)
+        # ------------------------------------
+
+        # Start threads
+        self.lyric_thread.start()
+        self.api_thread.start()
+
+    @Slot(str, str)
+    def on_new_lyrics(self, main_text, next_text):
+        """Slot to receive new lyrics and trigger animation."""
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.raise_()
+        self.show()
+        self.next_label.setText(next_text)
+        
+        # Stop any ongoing animation
+        self.animation_group.stop()
+        
+        # Prepare the inactive label
+        self.inactive_main_label.setText(main_text)
+        self.hidden_opacity_effect.setOpacity(0.0)
+        self.inactive_main_label.setHidden(False)
+        self.inactive_main_label.setStyleSheet(self.main_label_style) # Ensure style
+        
+        # Create fade-out animation for the current label
+        anim_out = QPropertyAnimation(self.main_opacity_effect, b"opacity")
+        anim_out.setDuration(250) # 250ms fade
+        anim_out.setStartValue(1.0)
+        anim_out.setEndValue(0.0)
+        anim_out.setEasingCurve(QEasingCurve.InQuad)
+        
+        # Create fade-in animation for the new label
+        anim_in = QPropertyAnimation(self.hidden_opacity_effect, b"opacity")
+        anim_in.setDuration(250)
+        anim_in.setStartValue(0.0)
+        anim_in.setEndValue(1.0)
+        anim_in.setEasingCurve(QEasingCurve.OutQuad)
+        
+        self.animation_group = QParallelAnimationGroup(self)
+        self.animation_group.addAnimation(anim_out)
+        self.animation_group.addAnimation(anim_in)
+        
+        # When animation finishes, swap the labels
+        self.animation_group.finished.connect(self.swap_active_label)
+        self.animation_group.start()
+
+    def swap_active_label(self):
+        """Swaps the active and inactive labels post-animation."""
+        # Check if animation group is still running (prevents rare race condition)
+        if self.animation_group.state() == QPropertyAnimation.State.Running:
+            return
+            
+        self.active_main_label.setHidden(True)
+        self.main_opacity_effect.setOpacity(1.0) # Reset for next time
+        
+        # Swap roles
+        self.active_main_label, self.inactive_main_label = \
+            self.inactive_main_label, self.active_main_label
+            
+        # Swap opacity effects
+        self.main_opacity_effect, self.hidden_opacity_effect = \
+            self.hidden_opacity_effect, self.main_opacity_effect
+
+    @Slot(str, str)
+    def on_status_update(self, main_text, next_text):
+        """Slot for non-animated updates (like 'No lyrics found')."""
+        self.animation_group.stop() # Stop any running animations
+        self.active_main_label.setText(main_text)
+        self.inactive_main_label.setHidden(True)
+        self.main_opacity_effect.setOpacity(1.0)
+        self.next_label.setText(next_text)
+        
+    @Slot(str)
+    def show_error(self, message):
+        """Shows a critical error and prepares to quit."""
+        print(f"[CRITICAL] {message}")
+        # Use Tkinter for the error box as Qt may not be fully init
+        root = Tk()
+        root.withdraw()
+        messagebox.showerror("Overlyrics: Critical Error", message)
+        root.destroy()
+        self.close()
+
+    def update_font_styles(self):
+        """Applies current font sizes and colors to labels."""
+        self.main_label_style = f"""
+            background-color: transparent;
+            color: {self.main_font_color};
+            font-family: '{self.main_font_family}';
+            font-size: {self.main_font_size}pt;
+            font-weight: 600;
+        """
+        self.next_label_style = f"""
+            background-color: transparent;
+            color: {self.next_font_color};
+            font-family: '{self.main_font_family}';
+            font-size: {self.next_font_size}pt;
+            font-weight: 400;
+        """
+        self.next_label.setStyleSheet(self.next_label_style)
+        self.active_main_label.setStyleSheet(self.main_label_style)
+        self.inactive_main_label.setStyleSheet(self.main_label_style)
+        
+        self.adjustSize() # Fit window to new text size
+        self.update()
+
+    def resize_font(self, delta):
+        self.main_font_size = max(8, self.main_font_size + delta)
+        self.next_font_size = max(6, int(self.main_font_size * 0.7))
+        self.update_font_styles()
+
+    # --- Window Controls (Right-click menu, Dragging) ---
+
+    def contextMenuEvent(self, event):
+        """Creates the right-click context menu."""
+        menu = QMenu(self)
+        
+        increase_font_action = QAction("Increase Font Size", self)
+        increase_font_action.triggered.connect(lambda: self.resize_font(2))
+        
+        decrease_font_action = QAction("Decrease Font Size", self)
+        decrease_font_action.triggered.connect(lambda: self.resize_font(-2))
+        
+        quit_action = QAction("Quit Overlyrics", self)
+        quit_action.triggered.connect(self.close)
+        
+        menu.addAction(increase_font_action)
+        menu.addAction(decrease_font_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        
+        menu.exec(event.globalPos())
+
+    def mousePressEvent(self, event):
+        """Captures mouse press for dragging."""
+        if event.button() == Qt.LeftButton:
+            self.drag_start_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        """Handles window dragging."""
+        if event.buttons() == Qt.LeftButton and self.drag_start_position:
+
+            self.move(event.globalPosition().toPoint() - self.drag_start_position)
+            event.accept()
+
+    def closeEvent(self, event):
+        """Handles application quit."""
+        print("[INFO] Quitting app...")
+        if hasattr(self, 'api_worker'):
+            self.api_worker.stop()
+        if hasattr(self, 'lyric_worker'):
+            self.lyric_worker.stop()
+        
+
+        time.sleep(0.2)
+        
+        if hasattr(self, 'api_thread'):
+            self.api_thread.quit()
+        if hasattr(self, 'lyric_thread'):
+            self.lyric_thread.quit()
+            
+        print("[INFO] Cleanup complete. Exiting.")
+        QApplication.quit()
+
+
+if __name__ == "__main__":
+    
+
+    os.environ["QT_HIGH_DPI_SCALE_FACTOR_ROUNDING_POLICY"] = "PassThrough"
+    
+    app = QApplication(sys.argv)
+    
+    # Check for client ID
+    if CLIENT_ID == "YOUR_OWN_CLIENT_ID_GOES_HERE":
+        root = Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "Overlyrics: Configuration Error",
+            "Please add your own Spotify Client ID to the python script (line 53) to continue."
+        )
+        root.destroy()
+        sys.exit()
+
+    window = OverlyricsWindow()
+    window.adjustSize()  
+    window.repaint()
+    window.raise_()
+    screen = app.primaryScreen()
+    geo = screen.geometry()
+    avail = screen.availableGeometry()
+
+    taskbar_height = geo.height() - avail.height()
+
+    window_width = window.width()
+    window_height = window.height()
+
+    x = (geo.width() - window_width) // 2
+    y = geo.height() - window_height - (taskbar_height // 2)
+
+    print(f"[INFO] Positioning window at ({x}, {y})")
+    window.move(x, y)
+
+    window.show()
+    sys.exit(app.exec())
