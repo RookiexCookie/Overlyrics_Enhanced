@@ -31,7 +31,7 @@ LYRIC_UPDATE_POLL_RATE = 0.05 # (seconds) Update every 50ms for smoother sync
 # 1. Go to https://developer.spotify.com/dashboard/
 # 2. Create an app
 # 3. Paste the Client ID here
-CLIENT_ID = "026011d0727c4c2db8c9b77405efa6f4" 
+CLIENT_ID = "YOUR_OWN_CLIENT_ID_GOES_HERE" 
 # 4. In your app's settings, add this as a Redirect URI
 REDIRECT_URI = "https://cezargab.github.io/Overlyrics"
 SCOPE = "user-read-playback-state"

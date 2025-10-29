@@ -1,4 +1,33 @@
-# Overlyrics (Enhanced Fork)
+<p align="center">
+ <img width="400px" src="Logos/main-logo.png" align="center" alt="GitHub Readme Stats" />
+ <h2 align="center">Overlyrics Enhanced</h2>
+ <p align="center">Bringing the lyrics to life!</p>
+</p>
+  <p align="center">
+    <a href="https://www.python.org">
+      <img alt="Python 3.9" src="https://img.shields.io/badge/Python-3.9-3776AB.svg?style=flat&logo=python&logoColor=white" />
+    </a>
+    <a>
+      <img alt="License - MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg" />
+    </a>
+    <br />
+    <br />
+    <a>
+      <img src="https://img.shields.io/badge/Spotify-1ED760?&style=for-the-badge&logo=spotify&logoColor=white"/>
+    </a>
+    <a>
+      <img src="https://img.shields.io/badge/Python-FFD43B?style=for-the-badge&logo=python&logoColor=blue"/>
+    </a>
+    <a>
+      <img src="https://img.shields.io/badge/GitHub%20Pages-222222?style=for-the-badge&logo=GitHub%20Pages&logoColor=white"/>
+    </a>
+ <p align="center">
+   <a>
+      <img src="demo.gif"/>
+    </a>
+  </p>
+
+
 
 Overlyrics is a desktop lyrics overlay that displays **real-time, synchronized Spotify lyrics** on top of any window.  
 This fork improves performance, adds a modern UI using **PySide6 (Qt)** instead of Tkinter for the overlay window, and includes several bug fixes for long-term stability.
@@ -21,7 +50,7 @@ This fork improves performance, adds a modern UI using **PySide6 (Qt)** instead 
 
 ## 🧩 What You Need To Run the Python Script (`Overlyrics.py`)
 
-If you are **not** using the `.exe` and want to run from source, install:
+First install:
 
 ```
 pip install spotipy
@@ -57,13 +86,6 @@ python Overlyrics.py
 
 The floating lyrics overlay will appear and stay on top of other windows.  
 Drag with **left-click**, right-click to open menu (resize text / quit).
-
----
-
-## 🖥️ Running the Executable
-
-The provided `Overlyrics.exe` already includes all dependencies.  
-Just run it — no external Python packages required.
 
 ---
 
